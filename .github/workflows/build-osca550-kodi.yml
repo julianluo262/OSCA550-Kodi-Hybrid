@@ -76,6 +76,26 @@ jobs:
           echo "Kodi branch: $(git branch --show-current)"
           echo "Kodi commit: $(git rev-parse --short HEAD)"
 
+      - name: Patch Samba swab compatibility for Android Bionic
+        run: |
+          set -euo pipefail
+          PATCH="$HOME/kodi/tools/depends/target/samba-gplv3/samba_android.patch"
+          test -f "$PATCH"
+          python3 - "$PATCH" <<'PYCODE'
+          from pathlib import Path
+          import sys
+
+          path = Path(sys.argv[1])
+          text = path.read_text()
+          old = '+#if defined(ANDROID) && (!defined(__ANDROID_API__) || __ANDROID_API__ < 28)\n+void swab'
+          new = '+#if defined(ANDROID) && (!defined(__ANDROID_API__) || __ANDROID_API__ < 28) && !defined(__BIONIC__)\n+void swab'
+          if text.count(old) != 1:
+              raise SystemExit(f'Expected exactly one Samba swab fallback guard; found {text.count(old)}. Source patch may have changed.')
+          path.write_text(text.replace(old, new, 1))
+          print('Patched Samba: do not compile its fallback swab() on Android Bionic.')
+          PYCODE
+          grep -n -A2 -B1 'void swab' "$PATCH"
+
       - name: Verify Hybrid Surface source is present
         run: |
           set -euo pipefail
