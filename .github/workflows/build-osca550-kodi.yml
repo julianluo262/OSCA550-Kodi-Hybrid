@@ -65,7 +65,7 @@ jobs:
           path: |
             ~/kodi-tarballs
             ~/kodi-depends
-          key: osca550-omega-arm64-deps-r26d-v1
+          key: osca550-omega-arm64-deps-r26d-ffmpeg-upstream-v2
 
       - name: Clone OSCA-550 Hybrid Surface Kodi fork
         run: |
@@ -116,6 +116,28 @@ jobs:
             -storepass android -keypass android \
             -alias androiddebugkey -keyalg RSA -keysize 2048 -validity 10000 \
             -dname 'CN=Android Debug,O=Android,C=US'
+
+      - name: Preload verified FFmpeg 6.1.4 source archive
+        run: |
+          set -euo pipefail
+          TARBALLS="$HOME/kodi-tarballs"
+          mkdir -p "$TARBALLS"
+          ARCHIVE="$TARBALLS/ffmpeg-6.1.4.tar.xz"
+          EXPECTED_SHA512="0d7d29fb170947805eb531f6c66641d0977d18831923d5a9c0442c160b02f94b890ccd04ecf350bb3dce59fe7bb64a426cab02bd65c05416c0d153f50104065f"
+
+          # Remove any cached completion marker so Kodi's depends system
+          # re-checks the preloaded archive.
+          rm -f "$ARCHIVE.sha512"
+
+          # Fetch from the official FFmpeg release server instead of the
+          # mirror that returned a different archive hash in the previous run.
+          curl --fail --location --silent --show-error \
+            --retry 5 --retry-all-errors --connect-timeout 30 \
+            "https://ffmpeg.org/releases/ffmpeg-6.1.4.tar.xz" \
+            --output "$ARCHIVE"
+
+          echo "$EXPECTED_SHA512  $ARCHIVE" | sha512sum --check -
+          ls -lh "$ARCHIVE"
 
       - name: Build Kodi dependencies
         run: |
