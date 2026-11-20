@@ -13,7 +13,9 @@ jobs:
     env:
       KODI_REPO: https://github.com/vkapartzianis/xbmc.git
       KODI_BRANCH: Omega
-      NDK_VERSION: 28.2.13676358
+      # r26d avoids the NDK r27+ timezone_t / mktime_z detection bug in GnuTLS
+      # when Kodi dependencies are built for Android API 24.
+      NDK_VERSION: 26.3.11579264
       ANDROID_API: 34
       ANDROID_BUILD_TOOLS: 34.0.0
       APP_ID: com.osca550.kodi
@@ -55,7 +57,7 @@ jobs:
             "platform-tools" \
             "platforms;android-34" \
             "build-tools;34.0.0" \
-            "ndk;28.2.13676358"
+            "ndk;26.3.11579264"
 
       - name: Cache Kodi dependency downloads
         uses: actions/cache@v4
@@ -63,7 +65,7 @@ jobs:
           path: |
             ~/kodi-tarballs
             ~/kodi-depends
-          key: osca550-omega-arm64-deps-r28c-v1
+          key: osca550-omega-arm64-deps-r26d-v1
 
       - name: Clone OSCA-550 Hybrid Surface Kodi fork
         run: |
