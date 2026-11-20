@@ -76,6 +76,22 @@ jobs:
           echo "Kodi branch: $(git branch --show-current)"
           echo "Kodi commit: $(git rev-parse --short HEAD)"
 
+      - name: Restore Kodi privacy policy for Android packaging
+        run: |
+          set -euo pipefail
+          POLICY="$HOME/kodi/privacy-policy.txt"
+
+          if [ ! -s "$POLICY" ]; then
+            curl --fail --location --silent --show-error \
+              --retry 5 --retry-all-errors --connect-timeout 30 \
+              "https://raw.githubusercontent.com/xbmc/xbmc/Omega/privacy-policy.txt" \
+              --output "$POLICY"
+          fi
+
+          test -s "$POLICY"
+          echo "Kodi privacy policy is ready:"
+          ls -lh "$POLICY"
+
       - name: Patch Samba swab compatibility for Android Bionic
         run: |
           set -euo pipefail
@@ -195,6 +211,7 @@ jobs:
         run: |
           set -euo pipefail
           cd "$HOME/kodi"
+          test -s "$HOME/kodi/privacy-policy.txt"
           make -C "$HOME/kodi-build" apk
           echo 'APK files found:'
           find "$HOME/kodi" "$HOME/kodi-build" -type f -name '*.apk' -print
