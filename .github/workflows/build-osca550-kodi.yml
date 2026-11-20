@@ -1,0 +1,158 @@
+name: Build Kodi OSCA550 Hybrid (Android ARM64)
+
+"on":
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 360
+    env:
+      KODI_REPO: https://github.com/vkapartzianis/xbmc.git
+      KODI_BRANCH: Omega
+      NDK_VERSION: 28.2.13676358
+      ANDROID_API: 34
+      ANDROID_BUILD_TOOLS: 34.0.0
+      APP_ID: com.osca550.kodi
+      APP_NAME: Kodi OSCA550 Hybrid
+    steps:
+      - name: Check out this workflow repository
+        uses: actions/checkout@v4
+
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            autoconf automake bison build-essential cmake curl flex gawk git gperf \
+            lib32stdc++6 lib32z1 lib32z1-dev libcurl4-openssl-dev libtool \
+            nasm ninja-build pkg-config python3 python3-pip unzip zip zlib1g-dev yasm
+          python3 -m pip install --user --upgrade 'cmake>=3.28,<4'
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          cmake --version
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK and NDK
+        uses: android-actions/setup-android@v3
+        with:
+          packages: |
+            platform-tools
+            platforms;android-34
+            build-tools;34.0.0
+            ndk;28.2.13676358
+
+      - name: Cache Kodi dependency downloads
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/kodi-tarballs
+            ~/kodi-depends
+          key: osca550-omega-arm64-deps-r28c-v1
+
+      - name: Clone OSCA-550 Hybrid Surface Kodi fork
+        run: |
+          set -euxo pipefail
+          git clone --depth 1 --single-branch --branch "$KODI_BRANCH" "$KODI_REPO" "$HOME/kodi"
+          cd "$HOME/kodi"
+          echo "Kodi source: $(git remote get-url origin)"
+          echo "Kodi branch: $(git branch --show-current)"
+          echo "Kodi commit: $(git rev-parse --short HEAD)"
+
+      - name: Verify Hybrid Surface source is present
+        run: |
+          set -euo pipefail
+          cd "$HOME/kodi"
+          grep -Rqs 'usemediacodechybridsurface' system xbmc || {
+            echo 'ERROR: Hybrid Surface setting not found in the selected source branch.'
+            exit 1
+          }
+          grep -Rqs 'XBMCVideoSurfaceRenderer' xbmc || {
+            echo 'ERROR: Hybrid Surface renderer source not found.'
+            exit 1
+          }
+          echo 'Hybrid Surface implementation detected.'
+
+      - name: Apply OSCA-550 first-test defaults
+        run: |
+          set -euo pipefail
+          python3 "$GITHUB_WORKSPACE/patches/enable_hybrid_defaults.py" "$HOME/kodi/system/settings/settings.xml"
+
+      - name: Set a separate Android package ID
+        run: |
+          set -euo pipefail
+          PACKAGING="$HOME/kodi/tools/android/packaging"
+          test -d "$PACKAGING"
+          grep -RIl 'org.xbmc.kodi' "$PACKAGING" | while read -r f; do
+            sed -i "s/org\\.xbmc\\.kodi/${APP_ID//./\\.}/g" "$f"
+          done
+          # Change only Android launcher/app-label references where the exact string occurs.
+          find "$PACKAGING" -type f \( -name '*.xml' -o -name '*.gradle' -o -name '*.properties' \) -print0 \
+            | xargs -0 -r sed -i 's/>Kodi</>Kodi OSCA550 Hybrid</g'
+
+      - name: Create Android signing key
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/.android"
+          keytool -genkeypair -v \
+            -keystore "$HOME/.android/debug.keystore" \
+            -storepass android -keypass android \
+            -alias androiddebugkey -keyalg RSA -keysize 2048 -validity 10000 \
+            -dname 'CN=Android Debug,O=Android,C=US'
+
+      - name: Build Kodi dependencies
+        run: |
+          set -euo pipefail
+          KODI="$HOME/kodi"
+          SDK="$ANDROID_SDK_ROOT"
+          NDK="$ANDROID_SDK_ROOT/ndk/$NDK_VERSION"
+          TARBALLS="$HOME/kodi-tarballs"
+          PREFIX="$HOME/kodi-depends"
+          mkdir -p "$TARBALLS" "$PREFIX"
+          cd "$KODI/tools/depends"
+          ./bootstrap
+          ./configure \
+            --with-tarballs="$TARBALLS" \
+            --host=aarch64-linux-android \
+            --with-sdk-path="$SDK" \
+            --with-ndk-path="$NDK" \
+            --with-ndk-api=24 \
+            --prefix="$PREFIX" \
+            --enable-debug=no
+          make -j2
+
+      - name: Configure Kodi Android build
+        run: |
+          set -euo pipefail
+          cd "$HOME/kodi"
+          make -C tools/depends/target/cmakebuildsys BUILD_DIR="$HOME/kodi-build"
+
+      - name: Compile Kodi
+        run: |
+          set -euo pipefail
+          make -C "$HOME/kodi-build" -j2
+
+      - name: Package Android APK
+        run: |
+          set -euo pipefail
+          cd "$HOME/kodi"
+          make -C "$HOME/kodi-build" apk
+          echo 'APK files found:'
+          find "$HOME/kodi" "$HOME/kodi-build" -type f -name '*.apk' -print
+          mkdir -p "$GITHUB_WORKSPACE/output"
+          find "$HOME/kodi" "$HOME/kodi-build" -type f -name '*.apk' -exec cp -v {} "$GITHUB_WORKSPACE/output/" \;
+          test -n "$(find "$GITHUB_WORKSPACE/output" -type f -name '*.apk' -print -quit)"
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Kodi-OSCA550-Hybrid-ARM64
+          path: output/*.apk
+          if-no-files-found: error
+          retention-days: 30
