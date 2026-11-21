@@ -172,7 +172,7 @@ jobs:
             "https://ffmpeg.org/releases/ffmpeg-6.1.4.tar.xz" \
             --output "$ARCHIVE"
 
-          echo "$EXPECTED_SHA512  $ARCHIVE" | sha512sum --check -
+          echo "$EXPECTED_SHA512 $ARCHIVE" | sha512sum --check -
           ls -lh "$ARCHIVE"
 
       - name: Build Kodi dependencies
@@ -207,11 +207,44 @@ jobs:
           set -euo pipefail
           make -C "$HOME/kodi-build" -j2
 
+      - name: Restore Android FileProvider resource
+        run: |
+          set -euo pipefail
+
+          # Kodi's Android packaging project is generated in kodi-build from
+          # the source tree. Populate both locations so the resource survives
+          # the packaging preparation/copy step regardless of which tree is used.
+          SOURCE_RES="$HOME/kodi/tools/android/packaging/xbmc/res/xml"
+          BUILD_RES="$HOME/kodi-build/tools/android/packaging/xbmc/res/xml"
+
+          for RES_DIR in "$SOURCE_RES" "$BUILD_RES"; do
+            mkdir -p "$RES_DIR"
+            cat > "$RES_DIR/file_paths.xml" <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <paths xmlns:android="http://schemas.android.com/apk/res/android">
+              <external-path
+                  name="external_storage"
+                  path="." />
+          </paths>
+          EOF
+            test -s "$RES_DIR/file_paths.xml"
+            echo "Created $RES_DIR/file_paths.xml"
+            cat "$RES_DIR/file_paths.xml"
+          done
+
+          # Fail early if the selected manifest no longer declares this resource.
+          grep -Rqs '@xml/file_paths' "$HOME/kodi/tools/android/packaging/xbmc" "$HOME/kodi-build/tools/android/packaging/xbmc" || {
+            echo 'ERROR: Android manifest no longer references @xml/file_paths; inspect packaging source layout.'
+            exit 1
+          }
+
       - name: Package Android APK
         run: |
           set -euo pipefail
           cd "$HOME/kodi"
           test -s "$HOME/kodi/privacy-policy.txt"
+          test -s "$HOME/kodi/tools/android/packaging/xbmc/res/xml/file_paths.xml"
+          test -s "$HOME/kodi-build/tools/android/packaging/xbmc/res/xml/file_paths.xml"
           make -C "$HOME/kodi-build" apk
           echo 'APK files found:'
           find "$HOME/kodi" "$HOME/kodi-build" -type f -name '*.apk' -print
