@@ -1,0 +1,288 @@
+name: Build OSCA550 Kodi Main10 Diagnostic C and D (ARM64)
+
+"on":
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 360
+    env:
+      KODI_REPO: https://github.com/vkapartzianis/xbmc.git
+      KODI_COMMIT: 1c2da8772de76760e63cd4c30f2ea7143c660e80
+      KODI_TARGET: android
+      # r26d avoids the NDK r27+ timezone_t / mktime_z detection bug in GnuTLS
+      # when Kodi dependencies are built for Android API 24.
+      NDK_VERSION: 26.3.11579264
+      ANDROID_API: 34
+      ANDROID_BUILD_TOOLS: 34.0.0
+    steps:
+      - name: Check out this workflow repository
+        uses: actions/checkout@v4
+
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            autoconf automake bison build-essential cmake curl flex gawk git gperf \
+            lib32stdc++6 lib32z1 lib32z1-dev libcurl4-openssl-dev libtool \
+            nasm ninja-build pkg-config python3 python3-pip unzip zip zlib1g-dev yasm
+          python3 -m pip install --user --upgrade 'cmake>=3.28,<4'
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          cmake --version
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK tools
+        uses: android-actions/setup-android@v3
+        with:
+          # Let sdkmanager install the exact packages in a separate step below.
+          # The action's packages input is a space-separated string, not a YAML list.
+          packages: ''
+          accept-android-sdk-licenses: true
+          log-accepted-android-sdk-licenses: false
+
+      - name: Install required Android SDK packages
+        run: |
+          set -euo pipefail
+          sdkmanager --install \
+            "platform-tools" \
+            "platforms;android-34" \
+            "build-tools;34.0.0" \
+            "ndk;26.3.11579264"
+
+      - name: Cache Kodi dependency downloads
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/kodi-tarballs
+            ~/kodi-depends
+          key: osca550-omega-arm64-deps-r26d-ffmpeg-upstream-v2
+
+      - name: Check out the exact source tested in the supplied logs
+        run: |
+          set -euo pipefail
+          git init "$HOME/kodi"
+          git -C "$HOME/kodi" remote add origin "$KODI_REPO"
+          git -C "$HOME/kodi" fetch --depth 1 origin "$KODI_COMMIT"
+          git -C "$HOME/kodi" checkout --detach FETCH_HEAD
+          test "$(git -C "$HOME/kodi" rev-parse HEAD)" = "$KODI_COMMIT"
+          test -f "$GITHUB_WORKSPACE/patches/prepare_osca550_diag.py"
+          test -f "$GITHUB_WORKSPACE/patches/prepare_osca550_main10.py"
+          test -f "$GITHUB_WORKSPACE/patches/collect_osca550_main10_apk.py"
+
+      - name: Restore Kodi privacy policy for Android packaging
+        run: |
+          set -euo pipefail
+          POLICY="$HOME/kodi/privacy-policy.txt"
+
+          if [ ! -s "$POLICY" ]; then
+            curl --fail --location --silent --show-error \
+              --retry 5 --retry-all-errors --connect-timeout 30 \
+              "https://raw.githubusercontent.com/xbmc/xbmc/Omega/privacy-policy.txt" \
+              --output "$POLICY"
+          fi
+
+          test -s "$POLICY"
+          echo "Kodi privacy policy is ready:"
+          ls -lh "$POLICY"
+
+      - name: Patch Samba swab compatibility for Android Bionic
+        run: |
+          set -euo pipefail
+          PATCH="$HOME/kodi/tools/depends/target/samba-gplv3/samba_android.patch"
+          test -f "$PATCH"
+          python3 - "$PATCH" <<'PYCODE'
+          from pathlib import Path
+          import sys
+
+          path = Path(sys.argv[1])
+          text = path.read_text()
+          old = '+#if defined(ANDROID) && (!defined(__ANDROID_API__) || __ANDROID_API__ < 28)\n+void swab'
+          new = '+#if defined(ANDROID) && (!defined(__ANDROID_API__) || __ANDROID_API__ < 28) && !defined(__BIONIC__)\n+void swab'
+          if text.count(old) != 1:
+              raise SystemExit(f'Expected exactly one Samba swab fallback guard; found {text.count(old)}. Source patch may have changed.')
+          path.write_text(text.replace(old, new, 1))
+          print('Patched Samba: do not compile its fallback swab() on Android Bionic.')
+          PYCODE
+          grep -n -A2 -B1 'void swab' "$PATCH"
+
+      - name: Verify Hybrid Surface source is present
+        run: |
+          set -euo pipefail
+          cd "$HOME/kodi"
+          grep -Rqs 'usemediacodechybridsurface' system xbmc || {
+            echo 'ERROR: Hybrid Surface setting not found in the selected source branch.'
+            exit 1
+          }
+          grep -Rqs 'XBMCVideoSurfaceRenderer' xbmc || {
+            echo 'ERROR: Hybrid Surface renderer source not found.'
+            exit 1
+          }
+          echo 'Hybrid Surface implementation detected.'
+
+      - name: Prepare diagnostic C with explicit Main10 profile
+        run: |
+          set -euo pipefail
+          python3 "$GITHUB_WORKSPACE/patches/prepare_osca550_main10.py" "$HOME/kodi" --variant C
+
+      - name: Cache diagnostic signing identity
+        uses: actions/cache@v4
+        with:
+          path: ~/.android/debug.keystore
+          key: osca550-diag-debug-signing-v1
+
+      - name: Create or verify diagnostic signing key
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/.android"
+          if [ ! -s "$HOME/.android/debug.keystore" ]; then
+            keytool -genkeypair \
+              -keystore "$HOME/.android/debug.keystore" \
+              -storepass android -keypass android \
+              -alias androiddebugkey -keyalg RSA -keysize 2048 -validity 10000 \
+              -dname 'CN=OSCA550 Diagnostic,O=Local Test,C=CN'
+          fi
+          keytool -list -keystore "$HOME/.android/debug.keystore" \
+            -storepass android -alias androiddebugkey
+
+      - name: Preload verified FFmpeg 6.1.4 source archive
+        run: |
+          set -euo pipefail
+          TARBALLS="$HOME/kodi-tarballs"
+          mkdir -p "$TARBALLS"
+          ARCHIVE="$TARBALLS/ffmpeg-6.1.4.tar.xz"
+          EXPECTED_SHA512="0d7d29fb170947805eb531f6c66641d0977d18831923d5a9c0442c160b02f94b890ccd04ecf350bb3dce59fe7bb64a426cab02bd65c05416c0d153f50104065f"
+
+          # Remove any cached completion marker so Kodi's depends system
+          # re-checks the preloaded archive.
+          rm -f "$ARCHIVE.sha512"
+
+          # Fetch from the official FFmpeg release server instead of the
+          # mirror that returned a different archive hash in the previous run.
+          curl --fail --location --silent --show-error \
+            --retry 5 --retry-all-errors --connect-timeout 30 \
+            "https://ffmpeg.org/releases/ffmpeg-6.1.4.tar.xz" \
+            --output "$ARCHIVE"
+
+          echo "$EXPECTED_SHA512  $ARCHIVE" | sha512sum --check -
+          ls -lh "$ARCHIVE"
+
+      - name: Build Kodi dependencies
+        run: |
+          set -euo pipefail
+          KODI="$HOME/kodi"
+          SDK="$ANDROID_SDK_ROOT"
+          NDK="$ANDROID_SDK_ROOT/ndk/$NDK_VERSION"
+          TARBALLS="$HOME/kodi-tarballs"
+          PREFIX="$HOME/kodi-depends"
+          mkdir -p "$TARBALLS" "$PREFIX"
+          cd "$KODI/tools/depends"
+          ./bootstrap
+          ./configure \
+            --with-tarballs="$TARBALLS" \
+            --host=aarch64-linux-android \
+            --with-sdk-path="$SDK" \
+            --with-ndk-path="$NDK" \
+            --with-ndk-api=24 \
+            --prefix="$PREFIX" \
+            --enable-debug=no
+          make -j2
+
+      - name: Configure Kodi Android build
+        run: |
+          set -euo pipefail
+          cd "$HOME/kodi"
+          make -C tools/depends/target/cmakebuildsys BUILD_DIR="$HOME/kodi-build"
+          grep -Fq 'applicationId "com.osca550.kodi.diag"' "$HOME/kodi-build/tools/android/packaging/xbmc/build.gradle"
+          grep -Fq 'package com.osca550.kodi.diag;' "$HOME/kodi-build/tools/android/packaging/xbmc/src/XBMCVideoView.java"
+          grep -Fq 'setFormat(PixelFormat.TRANSPARENT)' "$HOME/kodi-build/tools/android/packaging/xbmc/src/XBMCVideoView.java"
+
+      - name: Compile Kodi
+        run: |
+          set -euo pipefail
+          make -C "$HOME/kodi-build" -j2
+
+      - name: Restore Android FileProvider resource
+        run: |
+          set -euo pipefail
+
+          # Kodi's Android packaging project is generated in kodi-build from
+          # the source tree. Populate both locations so the resource survives
+          # the packaging preparation/copy step regardless of which tree is used.
+          SOURCE_RES="$HOME/kodi/tools/android/packaging/xbmc/res/xml"
+          BUILD_RES="$HOME/kodi-build/tools/android/packaging/xbmc/res/xml"
+
+          for RES_DIR in "$SOURCE_RES" "$BUILD_RES"; do
+            mkdir -p "$RES_DIR"
+            cat > "$RES_DIR/file_paths.xml" <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <paths xmlns:android="http://schemas.android.com/apk/res/android">
+              <external-path
+                  name="external_storage"
+                  path="." />
+          </paths>
+          EOF
+            test -s "$RES_DIR/file_paths.xml"
+            echo "Created $RES_DIR/file_paths.xml"
+            cat "$RES_DIR/file_paths.xml"
+          done
+
+          # Fail early if the selected manifest no longer declares this resource.
+          grep -Rqs '@xml/file_paths' "$HOME/kodi/tools/android/packaging/xbmc" "$HOME/kodi-build/tools/android/packaging/xbmc" || {
+            echo 'ERROR: Android manifest no longer references @xml/file_paths; inspect packaging source layout.'
+            exit 1
+          }
+
+      - name: Package and verify diagnostic C
+        run: |
+          set -euo pipefail
+          make -C "$HOME/kodi-build" apk
+          python3 "$GITHUB_WORKSPACE/patches/collect_osca550_main10_apk.py" \
+            "$HOME/kodi" "$HOME/kodi-build" "$GITHUB_WORKSPACE/output" \
+            "$ANDROID_SDK_ROOT/build-tools/$ANDROID_BUILD_TOOLS" --variant C
+          git -C "$HOME/kodi" diff -- \
+            xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecAndroidMediaCodec.cpp \
+            xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecAndroidMediaCodec.h \
+            tools/android/packaging/xbmc/src/XBMCVideoView.java.in \
+            tools/android/packaging/xbmc/strings.xml.in system/settings/settings.xml version.txt \
+            > "$GITHUB_WORKSPACE/output/source-changes-C.patch"
+
+      - name: Prepare diagnostic D with minimal MediaFormat
+        run: |
+          set -euo pipefail
+          python3 "$GITHUB_WORKSPACE/patches/prepare_osca550_main10.py" "$HOME/kodi" --variant D
+          cd "$HOME/kodi"
+          make -C tools/depends/target/cmakebuildsys BUILD_DIR="$HOME/kodi-build"
+          grep -Fq 'setFormat(PixelFormat.TRANSPARENT)' "$HOME/kodi-build/tools/android/packaging/xbmc/src/XBMCVideoView.java"
+          make -C "$HOME/kodi-build" -j2
+
+      - name: Package and verify diagnostic D
+        run: |
+          set -euo pipefail
+          make -C "$HOME/kodi-build" apk
+          python3 "$GITHUB_WORKSPACE/patches/collect_osca550_main10_apk.py" \
+            "$HOME/kodi" "$HOME/kodi-build" "$GITHUB_WORKSPACE/output" \
+            "$ANDROID_SDK_ROOT/build-tools/$ANDROID_BUILD_TOOLS" --variant D
+          git -C "$HOME/kodi" diff -- \
+            xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecAndroidMediaCodec.cpp \
+            xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecAndroidMediaCodec.h \
+            tools/android/packaging/xbmc/src/XBMCVideoView.java.in \
+            tools/android/packaging/xbmc/strings.xml.in system/settings/settings.xml version.txt \
+            > "$GITHUB_WORKSPACE/output/source-changes-D.patch"
+
+      - name: Upload verified APKs and build evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: OSCA550-Kodi-Main10-Diagnostic-C-D-ARM64
+          path: output/*
+          if-no-files-found: error
+          retention-days: 30
